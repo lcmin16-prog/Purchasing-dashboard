@@ -8,15 +8,22 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from config import ASSETS_DIR, COLORS, INVENTORY_FILE
+from config import ASSETS_DIR, COLORS, INVENTORY_FILE, LOGS_DIR
 from modules.data_loader import load_inventory_data
 
 st.set_page_config(page_title="장기재고현황 대시보드", layout="wide")
 
+log_handlers = [logging.StreamHandler()]
+try:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_handlers.insert(0, logging.FileHandler(LOGS_DIR / "app.log", encoding="utf-8"))
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("logs/app.log", encoding="utf-8"), logging.StreamHandler()],
+    handlers=log_handlers,
 )
 
 
