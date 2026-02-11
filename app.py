@@ -68,6 +68,34 @@ def sum_amount_by_department(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     return df.groupby("담당부서")[available].sum().sum(axis=1)
 
 
+def render_department_selector(options: list[str], key_prefix: str) -> str:
+    state_key = f"{key_prefix}_selected"
+    if state_key not in st.session_state or st.session_state[state_key] not in options:
+        st.session_state[state_key] = options[0]
+
+    per_row = max(1, (len(options) + 1) // 2)
+    row1 = options[:per_row]
+    row2 = options[per_row:]
+
+    for row_idx, row_options in enumerate([row1, row2]):
+        cols = st.columns(per_row)
+        for col_idx in range(per_row):
+            with cols[col_idx]:
+                if col_idx < len(row_options):
+                    option = row_options[col_idx]
+                    is_selected = st.session_state[state_key] == option
+                    if st.button(
+                        option,
+                        key=f"{key_prefix}_{row_idx}_{col_idx}",
+                        use_container_width=True,
+                        type="primary" if is_selected else "secondary",
+                    ):
+                        st.session_state[state_key] = option
+                else:
+                    st.empty()
+    return st.session_state[state_key]
+
+
 def _safe_excel_name(name: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
     return cleaned or "부서"
@@ -551,12 +579,8 @@ with left_col:
 
 with right_col:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    selected_right_department = st.radio(
-        "담당부서 선택",
-        department_options,
-        horizontal=True,
-        key="right_department_filter",
-    )
+    st.markdown("담당부서 선택")
+    selected_right_department = render_department_selector(department_options, "right_department_filter")
 
     graph_df = df
     if selected_right_department != "전체" and "담당부서" in df.columns:
