@@ -55,6 +55,15 @@ def format_krw(value: float) -> str:
     return f"{value:,.0f}원"
 
 
+def calculate_inventory_total_amount(df: pd.DataFrame) -> float:
+    amount_cols = [c for c in df.columns if c.endswith("_금액")]
+    if "M_금액" in df.columns:
+        return float(df["M_금액"].sum())
+    if amount_cols:
+        return float(df[amount_cols].sum().sum())
+    return 0.0
+
+
 def sum_amount(df: pd.DataFrame, cols: list[str]) -> float:
     available = [col for col in cols if col in df.columns]
     if not available:
@@ -66,6 +75,31 @@ def sum_amount_by_department(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     if not available or "담당부서" not in df.columns:
         return pd.Series(dtype=float)
     return df.groupby("담당부서")[available].sum().sum(axis=1)
+
+
+def render_department_selector(options: list[str], key_prefix: str, per_row: int = 4) -> str:
+    state_key = f"{key_prefix}_selected"
+    if state_key not in st.session_state or st.session_state[state_key] not in options:
+        st.session_state[state_key] = options[0]
+
+    for row_start in range(0, len(options), per_row):
+        row_options = options[row_start:row_start + per_row]
+        cols = st.columns(per_row)
+        for idx in range(per_row):
+            with cols[idx]:
+                if idx < len(row_options):
+                    option = row_options[idx]
+                    is_selected = st.session_state[state_key] == option
+                    if st.button(
+                        option,
+                        key=f"{key_prefix}_{row_start}_{idx}",
+                        use_container_width=True,
+                        type="primary" if is_selected else "secondary",
+                    ):
+                        st.session_state[state_key] = option
+                else:
+                    st.empty()
+    return st.session_state[state_key]
 
 
 def _safe_excel_name(name: str) -> str:
@@ -83,6 +117,33 @@ def get_github_config() -> dict:
         "repo": repo,
         "branch": branch,
     }
+
+
+DEFAULT_DEPARTMENTS = ["일본팀", "국내", "미주/유럽팀", "중국팀", "아시아/중동/CIS팀", "공통"]
+INVENTORY_META_FILE = INVENTORY_FILE.parent / "inventory_upload_meta.json"
+DISPOSAL_META_FILE = INVENTORY_FILE.parent / "disposal_upload_meta.json"
+
+
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _to_display_time(value: str) -> str:
+    if not value:
+        return "미업로드"
+    return str(value)
+
+
+def infer_department_from_filename(filename: str, known_departments: list[str]) -> str:
+    stem = Path(filename).stem.strip()
+    stem = re.sub(r"^소진계획[_\\-\\s]*", "", stem)
+    stem = stem.strip()
+    if stem in known_departments:
+        return stem
+    for dept in known_departments:
+        if dept in stem or stem in dept:
+            return dept
+    return stem if stem else "미분류"
 
 
 def _github_api_url(repo: str, path: str, branch: str, include_ref: bool = True) -> str:
@@ -155,6 +216,33 @@ def github_list_directory(cfg: dict, path: str) -> list[dict]:
     return []
 
 
+def load_upload_metadata(cfg: dict, local_path: Path, github_path: str, default_value: dict) -> dict:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if cfg.get("enabled"):
+        data = github_get_file_bytes(cfg, github_path)
+        if data:
+            try:
+                metadata = json.loads(data.decode("utf-8"))
+                local_path.write_bytes(data)
+                return metadata
+            except Exception:
+                logging.warning("Invalid metadata from github: %s", github_path)
+    if local_path.exists():
+        try:
+            return json.loads(local_path.read_text(encoding="utf-8"))
+        except Exception:
+            logging.warning("Invalid local metadata: %s", local_path.name)
+    return default_value.copy()
+
+
+def save_upload_metadata(cfg: dict, local_path: Path, github_path: str, metadata: dict, message: str) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+    local_path.write_bytes(payload)
+    if cfg.get("enabled"):
+        github_put_file_bytes(cfg, github_path, payload, message)
+
+
 def sync_disposal_uploads_from_github(cfg: dict, upload_dir: Path) -> int:
     if not cfg.get("enabled"):
         return 0
@@ -221,9 +309,14 @@ def persist_uploaded_file(uploaded, target_path: Path, github_cfg: dict) -> bool
     return False
 
 
-def persist_disposal_uploads(uploaded_files: list, github_cfg: dict) -> int:
+def persist_disposal_uploads(
+    uploaded_files: list,
+    github_cfg: dict,
+    known_departments: list[str],
+) -> tuple[int, dict[str, str]]:
     DISPOSAL_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     saved = 0
+    department_updates: dict[str, str] = {}
     for uploaded in uploaded_files:
         safe_name = _safe_excel_name(Path(uploaded.name).name)
         target = DISPOSAL_UPLOAD_DIR / safe_name
@@ -236,8 +329,10 @@ def persist_disposal_uploads(uploaded_files: list, github_cfg: dict) -> int:
                 data,
                 f"update disposal plan: {safe_name}",
             )
+        department = infer_department_from_filename(uploaded.name, known_departments)
+        department_updates[department] = _now_str()
         saved += 1
-    return saved
+    return saved, department_updates
 
 
 def _status_priority(status: str) -> int:
@@ -338,13 +433,6 @@ st.markdown(
 
 st.markdown("<div class='dashboard-title'>🏢 장기재고현황 대시보드</div>", unsafe_allow_html=True)
 
-base_date = datetime.now().strftime("%Y-%m-%d")
-update_time = "오전 9:00"
-st.markdown(
-    f"<div class='dashboard-meta'>📅 데이터 기준일: {base_date} | 🔄 최종 업데이트: {update_time}</div>",
-    unsafe_allow_html=True,
-)
-
 uploaded_file = st.file_uploader("장기재고현황 업로드", type=["xlsx"])
 uploaded_disposal_files = st.file_uploader(
     "소진계획 파일 업로드(부서별, 복수 선택 가능)",
@@ -353,6 +441,24 @@ uploaded_disposal_files = st.file_uploader(
 )
 data_source_label = None
 github_cfg = get_github_config()
+inventory_meta = load_upload_metadata(
+    github_cfg,
+    INVENTORY_META_FILE,
+    "data/inventory_upload_meta.json",
+    {
+        "last_uploaded_at": "",
+        "last_uploaded_file": "",
+        "last_total_amount": None,
+        "previous_uploaded_at": "",
+        "previous_total_amount": None,
+    },
+)
+disposal_meta = load_upload_metadata(
+    github_cfg,
+    DISPOSAL_META_FILE,
+    "data/disposal_upload_meta.json",
+    {"departments": {}},
+)
 if github_cfg.get("enabled"):
     st.caption(f"GitHub 자동저장 모드: {github_cfg['repo']} ({github_cfg['branch']})")
 elif uploaded_file is not None or uploaded_disposal_files:
@@ -363,7 +469,26 @@ if uploaded_file is not None:
     inventory_sig = f"{uploaded_file.name}:{len(inventory_bytes)}:{hash(inventory_bytes)}"
     if st.session_state.get("inventory_upload_sig") != inventory_sig:
         try:
+            uploaded_df_preview = load_inventory_data(uploaded_file.getvalue())
+            new_total_amount = calculate_inventory_total_amount(uploaded_df_preview)
+            prev_last_amount = inventory_meta.get("last_total_amount")
+            prev_last_uploaded_at = inventory_meta.get("last_uploaded_at", "")
+
             github_synced = persist_uploaded_file(uploaded_file, LATEST_INVENTORY_FILE, github_cfg)
+            if prev_last_amount is not None:
+                inventory_meta["previous_total_amount"] = float(prev_last_amount)
+            if prev_last_uploaded_at:
+                inventory_meta["previous_uploaded_at"] = prev_last_uploaded_at
+            inventory_meta["last_uploaded_at"] = _now_str()
+            inventory_meta["last_uploaded_file"] = uploaded_file.name
+            inventory_meta["last_total_amount"] = float(new_total_amount)
+            save_upload_metadata(
+                github_cfg,
+                INVENTORY_META_FILE,
+                "data/inventory_upload_meta.json",
+                inventory_meta,
+                "update inventory upload metadata",
+            )
             st.session_state["inventory_upload_sig"] = inventory_sig
             if github_synced:
                 st.success("장기재고현황 최신 파일을 GitHub와 로컬에 반영했습니다.")
@@ -377,7 +502,21 @@ if uploaded_disposal_files:
     disposal_sig = tuple((f.name, f.size) for f in uploaded_disposal_files)
     if st.session_state.get("disposal_upload_sig") != disposal_sig:
         try:
-            saved_count = persist_disposal_uploads(uploaded_disposal_files, github_cfg)
+            saved_count, dept_updates = persist_disposal_uploads(
+                uploaded_disposal_files,
+                github_cfg,
+                DEFAULT_DEPARTMENTS,
+            )
+            if "departments" not in disposal_meta or not isinstance(disposal_meta["departments"], dict):
+                disposal_meta["departments"] = {}
+            disposal_meta["departments"].update(dept_updates)
+            save_upload_metadata(
+                github_cfg,
+                DISPOSAL_META_FILE,
+                "data/disposal_upload_meta.json",
+                disposal_meta,
+                "update disposal upload metadata",
+            )
             st.session_state["disposal_upload_sig"] = disposal_sig
             if github_cfg.get("enabled"):
                 st.success(f"소진계획 파일 {saved_count}개를 GitHub와 로컬에 반영했습니다.")
@@ -396,6 +535,27 @@ if github_cfg.get("enabled") and not st.session_state.get("github_disposal_synce
     except Exception as exc:
         logging.exception("Failed to sync disposal uploads from GitHub")
         st.warning(f"GitHub 소진계획 동기화 실패: {exc}")
+
+inventory_uploaded_at = inventory_meta.get("last_uploaded_at", "")
+base_date = inventory_uploaded_at[:10] if inventory_uploaded_at else "미설정"
+inventory_update_text = _to_display_time(inventory_uploaded_at)
+previous_inventory_update_text = _to_display_time(inventory_meta.get("previous_uploaded_at", ""))
+st.markdown(
+    f"<div class='dashboard-meta'>📅 데이터 기준일: {base_date} | 🗂 장기재고현황 업데이트: {inventory_update_text} | ⏮ 이전업데이트: {previous_inventory_update_text}</div>",
+    unsafe_allow_html=True,
+)
+
+disposal_departments = disposal_meta.get("departments", {}) if isinstance(disposal_meta, dict) else {}
+display_departments = DEFAULT_DEPARTMENTS + sorted([d for d in disposal_departments.keys() if d not in DEFAULT_DEPARTMENTS])
+st.markdown("<div class='dashboard-meta'>🧾 소진계획 파일 업로드(담당부서별 마지막)</div>", unsafe_allow_html=True)
+update_rows = [
+    {
+        "담당부서": dept,
+        "마지막 업로드": _to_display_time(disposal_departments.get(dept, "")),
+    }
+    for dept in display_departments
+]
+st.dataframe(pd.DataFrame(update_rows), use_container_width=True, hide_index=True, height=245)
 
 active_inventory_file = LATEST_INVENTORY_FILE if LATEST_INVENTORY_FILE.exists() else INVENTORY_FILE
 
@@ -435,11 +595,20 @@ if disposal_status_map:
 
 department_options = ["전체"]
 if "담당부서" in df.columns:
-    department_options += sorted(df["담당부서"].dropna().unique().tolist())
+    dept_values = (
+        df["담당부서"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    dept_values = dept_values[
+        (dept_values != "")
+        & (dept_values != "담당부서")
+    ]
+    department_options += sorted(dept_values.unique().tolist())
 
 amount_cols = [c for c in df.columns if c.endswith("_금액")]
-current_amount = df["M_금액"].sum() if "M_금액" in df.columns else df[amount_cols].sum().sum()
-prev_amount = df["M-1_금액"].sum() if "M-1_금액" in df.columns else current_amount
+current_amount = calculate_inventory_total_amount(df)
 
 long_term_amount = df["12개월+_금액"].sum() if "12개월+_금액" in df.columns else 0
 long_term_items = int((df["12개월+_금액"] > 0).sum()) if "12개월+_금액" in df.columns else 0
@@ -451,7 +620,7 @@ kpi_html = """
   <div class='kpi-card'>
     <div class='kpi-header'>💰 총재고금액</div>
     <div class='kpi-value'>{total_amount}</div>
-    <div class='kpi-delta' style='color:{delta_color};'>▲ {delta_pct:.1f}% (전월대비)</div>
+    <div class='kpi-delta' style='color:{delta_color};'>{delta_text}</div>
   </div>
   <div class='kpi-card'>
     <div class='kpi-header'>⚠️ 장기재고</div>
@@ -471,15 +640,27 @@ kpi_html = """
 </div>
 """
 
-delta_pct = ((current_amount - prev_amount) / prev_amount * 100) if prev_amount else 0
+prev_update_amount = inventory_meta.get("previous_total_amount")
+try:
+    prev_update_amount = float(prev_update_amount) if prev_update_amount is not None else None
+except Exception:
+    prev_update_amount = None
+
+if prev_update_amount and prev_update_amount != 0:
+    delta_pct = (current_amount - prev_update_amount) / prev_update_amount * 100
+    delta_text = f"{'▲' if delta_pct >= 0 else '▼'} {abs(delta_pct):.1f}% (이전업데이트 대비)"
+    delta_color = COLORS["danger_red"] if delta_pct >= 0 else COLORS["primary_blue"]
+else:
+    delta_text = "이전업데이트 없음"
+    delta_color = COLORS["text_gray"]
 
 total_amount_display = format_krw(current_amount)
 
 st.markdown(
     kpi_html.format(
         total_amount=total_amount_display,
-        delta_pct=delta_pct,
-        delta_color=COLORS["danger_red"] if delta_pct >= 0 else COLORS["primary_blue"],
+        delta_text=delta_text,
+        delta_color=delta_color,
         long_amount=format_krw(long_term_amount),
         long_items=long_term_items,
         long_rate=long_term_rate,
@@ -564,11 +745,11 @@ with left_col:
 
 with right_col:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    selected_right_department = st.radio(
-        "담당부서 선택",
+    st.markdown("담당부서 선택")
+    selected_right_department = render_department_selector(
         department_options,
-        horizontal=True,
-        key="right_department_filter",
+        "right_department_filter",
+        per_row=4,
     )
 
     graph_df = df
