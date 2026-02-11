@@ -77,29 +77,18 @@ def sum_amount_by_department(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     return df.groupby("담당부서")[available].sum().sum(axis=1)
 
 
-def render_department_selector(options: list[str], key_prefix: str, per_row: int = 4) -> str:
-    state_key = f"{key_prefix}_selected"
-    if state_key not in st.session_state or st.session_state[state_key] not in options:
-        st.session_state[state_key] = options[0]
+def remove_header_like_rows(df: pd.DataFrame) -> pd.DataFrame:
+    key_cols = [col for col in ["담당부서", "품목코드", "품목명"] if col in df.columns]
+    if not key_cols:
+        return df
 
-    for row_start in range(0, len(options), per_row):
-        row_options = options[row_start:row_start + per_row]
-        cols = st.columns(per_row)
-        for idx in range(per_row):
-            with cols[idx]:
-                if idx < len(row_options):
-                    option = row_options[idx]
-                    is_selected = st.session_state[state_key] == option
-                    if st.button(
-                        option,
-                        key=f"{key_prefix}_{row_start}_{idx}",
-                        use_container_width=True,
-                        type="primary" if is_selected else "secondary",
-                    ):
-                        st.session_state[state_key] = option
-                else:
-                    st.empty()
-    return st.session_state[state_key]
+    header_like = pd.Series(True, index=df.index)
+    for col in key_cols:
+        header_like &= df[col].astype(str).str.strip().eq(col)
+
+    if header_like.any():
+        return df.loc[~header_like].reset_index(drop=True)
+    return df
 
 
 def _safe_excel_name(name: str) -> str:
@@ -424,7 +413,11 @@ st.markdown(
       display: flex;
       flex-wrap: wrap;
       row-gap: 0.35rem;
-      column-gap: 1rem;
+      column-gap: 0.75rem;
+    }
+    div[data-testid="stRadio"] div[role="radiogroup"] > label {
+      flex: 0 0 calc(25% - 0.75rem);
+      margin: 0;
     }
     </style>
     """,
@@ -432,13 +425,6 @@ st.markdown(
 )
 
 st.markdown("<div class='dashboard-title'>🏢 장기재고현황 대시보드</div>", unsafe_allow_html=True)
-
-uploaded_file = st.file_uploader("장기재고현황 업로드", type=["xlsx"])
-uploaded_disposal_files = st.file_uploader(
-    "소진계획 파일 업로드(부서별, 복수 선택 가능)",
-    type=["xlsx"],
-    accept_multiple_files=True,
-)
 data_source_label = None
 github_cfg = get_github_config()
 inventory_meta = load_upload_metadata(
@@ -459,82 +445,15 @@ disposal_meta = load_upload_metadata(
     "data/disposal_upload_meta.json",
     {"departments": {}},
 )
-if github_cfg.get("enabled"):
-    st.caption(f"GitHub 자동저장 모드: {github_cfg['repo']} ({github_cfg['branch']})")
-elif uploaded_file is not None or uploaded_disposal_files:
-    st.warning("GitHub 자동저장이 비활성화되어 로컬 반영만 수행됩니다.")
-
-if uploaded_file is not None:
-    inventory_bytes = uploaded_file.getvalue()
-    inventory_sig = f"{uploaded_file.name}:{len(inventory_bytes)}:{hash(inventory_bytes)}"
-    if st.session_state.get("inventory_upload_sig") != inventory_sig:
-        try:
-            uploaded_df_preview = load_inventory_data(uploaded_file.getvalue())
-            new_total_amount = calculate_inventory_total_amount(uploaded_df_preview)
-            prev_last_amount = inventory_meta.get("last_total_amount")
-            prev_last_uploaded_at = inventory_meta.get("last_uploaded_at", "")
-
-            github_synced = persist_uploaded_file(uploaded_file, LATEST_INVENTORY_FILE, github_cfg)
-            if prev_last_amount is not None:
-                inventory_meta["previous_total_amount"] = float(prev_last_amount)
-            if prev_last_uploaded_at:
-                inventory_meta["previous_uploaded_at"] = prev_last_uploaded_at
-            inventory_meta["last_uploaded_at"] = _now_str()
-            inventory_meta["last_uploaded_file"] = uploaded_file.name
-            inventory_meta["last_total_amount"] = float(new_total_amount)
-            save_upload_metadata(
-                github_cfg,
-                INVENTORY_META_FILE,
-                "data/inventory_upload_meta.json",
-                inventory_meta,
-                "update inventory upload metadata",
-            )
-            st.session_state["inventory_upload_sig"] = inventory_sig
-            if github_synced:
-                st.success("장기재고현황 최신 파일을 GitHub와 로컬에 반영했습니다.")
-            else:
-                st.success("장기재고현황 최신 파일을 로컬에 저장했습니다.")
-        except Exception as exc:
-            logging.exception("Failed to persist inventory upload")
-            st.error(f"장기재고현황 저장 중 오류가 발생했습니다: {exc}")
-
-if uploaded_disposal_files:
-    disposal_sig = tuple((f.name, f.size) for f in uploaded_disposal_files)
-    if st.session_state.get("disposal_upload_sig") != disposal_sig:
-        try:
-            saved_count, dept_updates = persist_disposal_uploads(
-                uploaded_disposal_files,
-                github_cfg,
-                DEFAULT_DEPARTMENTS,
-            )
-            if "departments" not in disposal_meta or not isinstance(disposal_meta["departments"], dict):
-                disposal_meta["departments"] = {}
-            disposal_meta["departments"].update(dept_updates)
-            save_upload_metadata(
-                github_cfg,
-                DISPOSAL_META_FILE,
-                "data/disposal_upload_meta.json",
-                disposal_meta,
-                "update disposal upload metadata",
-            )
-            st.session_state["disposal_upload_sig"] = disposal_sig
-            if github_cfg.get("enabled"):
-                st.success(f"소진계획 파일 {saved_count}개를 GitHub와 로컬에 반영했습니다.")
-            else:
-                st.success(f"소진계획 파일 {saved_count}개를 로컬에 반영했습니다.")
-        except Exception as exc:
-            logging.exception("Failed to persist disposal uploads")
-            st.error(f"소진계획 파일 저장 중 오류가 발생했습니다: {exc}")
 
 if github_cfg.get("enabled") and not st.session_state.get("github_disposal_synced"):
     try:
         synced = sync_disposal_uploads_from_github(github_cfg, DISPOSAL_UPLOAD_DIR)
         st.session_state["github_disposal_synced"] = True
-        if synced > 0:
-            st.caption(f"GitHub 소진계획 파일 동기화: {synced}개")
+        st.session_state["github_disposal_synced_count"] = synced
     except Exception as exc:
         logging.exception("Failed to sync disposal uploads from GitHub")
-        st.warning(f"GitHub 소진계획 동기화 실패: {exc}")
+        st.session_state["github_disposal_sync_error"] = str(exc)
 
 inventory_uploaded_at = inventory_meta.get("last_uploaded_at", "")
 base_date = inventory_uploaded_at[:10] if inventory_uploaded_at else "미설정"
@@ -544,18 +463,6 @@ st.markdown(
     f"<div class='dashboard-meta'>📅 데이터 기준일: {base_date} | 🗂 장기재고현황 업데이트: {inventory_update_text} | ⏮ 이전업데이트: {previous_inventory_update_text}</div>",
     unsafe_allow_html=True,
 )
-
-disposal_departments = disposal_meta.get("departments", {}) if isinstance(disposal_meta, dict) else {}
-display_departments = DEFAULT_DEPARTMENTS + sorted([d for d in disposal_departments.keys() if d not in DEFAULT_DEPARTMENTS])
-st.markdown("<div class='dashboard-meta'>🧾 소진계획 파일 업로드(담당부서별 마지막)</div>", unsafe_allow_html=True)
-update_rows = [
-    {
-        "담당부서": dept,
-        "마지막 업로드": _to_display_time(disposal_departments.get(dept, "")),
-    }
-    for dept in display_departments
-]
-st.dataframe(pd.DataFrame(update_rows), use_container_width=True, hide_index=True, height=245)
 
 active_inventory_file = LATEST_INVENTORY_FILE if LATEST_INVENTORY_FILE.exists() else INVENTORY_FILE
 
@@ -580,8 +487,7 @@ except Exception as exc:
     st.error(f"데이터 로딩 중 오류가 발생했습니다: {exc}")
     st.stop()
 
-if data_source_label:
-    st.caption(data_source_label)
+df = remove_header_like_rows(df)
 
 disposal_status_map = build_disposal_status_map(DISPOSAL_UPLOAD_DIR)
 if "품목코드" in df.columns:
@@ -589,9 +495,6 @@ if "품목코드" in df.columns:
     df["소진계획"] = item_codes.map(disposal_status_map).fillna("❌ 미등록")
 else:
     df["소진계획"] = "❌ 미등록"
-
-if disposal_status_map:
-    st.caption(f"소진계획 반영 품목 수: {len(disposal_status_map)}")
 
 department_options = ["전체"]
 if "담당부서" in df.columns:
@@ -674,7 +577,7 @@ st.markdown(
 
 st.markdown("<div class='section-title'>🎯 담당부서별 장기재고 현황</div>", unsafe_allow_html=True)
 
-left_col, right_col = st.columns([0.4, 0.6], gap="large")
+left_col, right_col = st.columns([0.5, 0.5], gap="large")
 
 with left_col:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
@@ -745,11 +648,11 @@ with left_col:
 
 with right_col:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("담당부서 선택")
-    selected_right_department = render_department_selector(
+    selected_right_department = st.radio(
+        "담당부서 선택",
         department_options,
-        "right_department_filter",
-        per_row=4,
+        horizontal=True,
+        key="right_department_filter",
     )
 
     graph_df = df
@@ -933,4 +836,115 @@ st.download_button(
 )
 
 st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<div class='section-title'>⬆️ 업로드 관리</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+
+if github_cfg.get("enabled"):
+    st.caption(f"GitHub 자동저장 모드: {github_cfg['repo']} ({github_cfg['branch']})")
+else:
+    st.caption("GitHub 자동저장 비활성화: 로컬 반영만 수행됩니다.")
+
+if st.session_state.get("github_disposal_sync_error"):
+    st.warning(f"GitHub 소진계획 동기화 실패: {st.session_state.get('github_disposal_sync_error')}")
+elif st.session_state.get("github_disposal_synced_count", 0) > 0:
+    st.caption(f"GitHub 소진계획 파일 동기화: {st.session_state.get('github_disposal_synced_count')}개")
+
+uploaded_file = st.file_uploader("장기재고현황 업로드", type=["xlsx"], key="inventory_upload_widget")
+uploaded_disposal_files = st.file_uploader(
+    "소진계획 파일 업로드(부서별, 복수 선택 가능)",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    key="disposal_upload_widget",
+)
+
+upload_processed = False
+
+if uploaded_file is not None:
+    inventory_bytes = uploaded_file.getvalue()
+    inventory_sig = f"{uploaded_file.name}:{len(inventory_bytes)}:{hash(inventory_bytes)}"
+    if st.session_state.get("inventory_upload_sig") != inventory_sig:
+        try:
+            uploaded_df_preview = load_inventory_data(uploaded_file.getvalue())
+            new_total_amount = calculate_inventory_total_amount(uploaded_df_preview)
+            prev_last_amount = inventory_meta.get("last_total_amount")
+            prev_last_uploaded_at = inventory_meta.get("last_uploaded_at", "")
+
+            github_synced = persist_uploaded_file(uploaded_file, LATEST_INVENTORY_FILE, github_cfg)
+            if prev_last_amount is not None:
+                inventory_meta["previous_total_amount"] = float(prev_last_amount)
+            if prev_last_uploaded_at:
+                inventory_meta["previous_uploaded_at"] = prev_last_uploaded_at
+            inventory_meta["last_uploaded_at"] = _now_str()
+            inventory_meta["last_uploaded_file"] = uploaded_file.name
+            inventory_meta["last_total_amount"] = float(new_total_amount)
+            save_upload_metadata(
+                github_cfg,
+                INVENTORY_META_FILE,
+                "data/inventory_upload_meta.json",
+                inventory_meta,
+                "update inventory upload metadata",
+            )
+
+            st.session_state["inventory_upload_sig"] = inventory_sig
+            st.success(
+                "장기재고현황 최신 파일을 GitHub와 로컬에 반영했습니다."
+                if github_synced
+                else "장기재고현황 최신 파일을 로컬에 저장했습니다."
+            )
+            upload_processed = True
+        except Exception as exc:
+            logging.exception("Failed to persist inventory upload")
+            st.error(f"장기재고현황 저장 중 오류가 발생했습니다: {exc}")
+
+if uploaded_disposal_files:
+    disposal_sig = tuple((f.name, f.size) for f in uploaded_disposal_files)
+    if st.session_state.get("disposal_upload_sig") != disposal_sig:
+        try:
+            saved_count, dept_updates = persist_disposal_uploads(
+                uploaded_disposal_files,
+                github_cfg,
+                DEFAULT_DEPARTMENTS,
+            )
+            if "departments" not in disposal_meta or not isinstance(disposal_meta["departments"], dict):
+                disposal_meta["departments"] = {}
+            disposal_meta["departments"].update(dept_updates)
+            save_upload_metadata(
+                github_cfg,
+                DISPOSAL_META_FILE,
+                "data/disposal_upload_meta.json",
+                disposal_meta,
+                "update disposal upload metadata",
+            )
+
+            st.session_state["disposal_upload_sig"] = disposal_sig
+            st.success(
+                f"소진계획 파일 {saved_count}개를 GitHub와 로컬에 반영했습니다."
+                if github_cfg.get("enabled")
+                else f"소진계획 파일 {saved_count}개를 로컬에 반영했습니다."
+            )
+            upload_processed = True
+        except Exception as exc:
+            logging.exception("Failed to persist disposal uploads")
+            st.error(f"소진계획 파일 저장 중 오류가 발생했습니다: {exc}")
+
+disposal_departments = disposal_meta.get("departments", {}) if isinstance(disposal_meta, dict) else {}
+display_departments = DEFAULT_DEPARTMENTS + sorted([d for d in disposal_departments.keys() if d not in DEFAULT_DEPARTMENTS])
+update_rows = [
+    {
+        "담당부서": dept,
+        "마지막 업로드": _to_display_time(disposal_departments.get(dept, "")),
+    }
+    for dept in display_departments
+]
+st.dataframe(pd.DataFrame(update_rows), use_container_width=True, hide_index=True, height=245)
+
+if data_source_label:
+    st.caption(data_source_label)
+st.caption(f"소진계획 반영 품목 수: {len(disposal_status_map)}")
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+if upload_processed:
+    st.rerun()
 
