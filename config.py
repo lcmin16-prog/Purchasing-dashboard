@@ -6,6 +6,8 @@ ASSETS_DIR = BASE_DIR / "assets"
 LOGS_DIR = BASE_DIR / "logs"
 
 INVENTORY_FILE = DATA_DIR / "장기재고현황.xlsx"
+LATEST_INVENTORY_FILE = DATA_DIR / "latest_장기재고현황.xlsx"
+DISPOSAL_UPLOAD_DIR = DATA_DIR / "disposal_uploads"
 EMAILS_FILE = DATA_DIR / "email_addresses.csv"
 DISPOSAL_FILE = DATA_DIR / "disposal_plans.csv"
 EMAIL_LOG_FILE = LOGS_DIR / "email_logs.csv"
