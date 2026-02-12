@@ -3,6 +3,7 @@ import re
 import zipfile
 import base64
 import json
+import math
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -230,14 +231,17 @@ def github_list_directory(cfg: dict, path: str) -> list[dict]:
 def load_upload_metadata(cfg: dict, local_path: Path, github_path: str, default_value: dict) -> dict:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     if cfg.get("enabled"):
-        data = github_get_file_bytes(cfg, github_path)
-        if data:
-            try:
-                metadata = json.loads(data.decode("utf-8"))
-                local_path.write_bytes(data)
-                return metadata
-            except Exception:
-                logging.warning("Invalid metadata from github: %s", github_path)
+        try:
+            data = github_get_file_bytes(cfg, github_path)
+            if data:
+                try:
+                    metadata = json.loads(data.decode("utf-8"))
+                    local_path.write_bytes(data)
+                    return metadata
+                except Exception:
+                    logging.warning("Invalid metadata from github: %s", github_path)
+        except Exception as exc:
+            logging.warning("Failed to load github metadata (%s): %s", github_path, exc)
     if local_path.exists():
         try:
             return json.loads(local_path.read_text(encoding="utf-8"))
@@ -799,7 +803,17 @@ with filter_cols[1]:
 with filter_cols[2]:
     amount_max = int(df["12개월+_금액"].max()) if "12개월+_금액" in df.columns else 0
     slider_max = amount_max if amount_max > 0 else 1
-    amount_range = st.slider("장기재고 금액", 0, slider_max, (0, slider_max))
+    # select_slider supports format_func, so handle values can be shown with commas.
+    step = max(1, math.ceil(slider_max / 5000))
+    amount_options = list(range(0, slider_max + 1, step))
+    if amount_options[-1] != slider_max:
+        amount_options.append(slider_max)
+    amount_range = st.select_slider(
+        "장기재고 금액",
+        options=amount_options,
+        value=(0, slider_max),
+        format_func=lambda x: f"{x:,}",
+    )
     st.caption(f"선택 범위: {amount_range[0]:,} ~ {amount_range[1]:,}")
 
 with filter_cols[3]:
