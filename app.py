@@ -110,9 +110,18 @@ def _safe_excel_name(name: str) -> str:
 
 
 def get_github_config() -> dict:
-    token = st.secrets.get("GITHUB_TOKEN", "")
-    repo = st.secrets.get("GITHUB_REPO", "")
-    branch = st.secrets.get("GITHUB_BRANCH", "main")
+    token = ""
+    repo = ""
+    branch = "main"
+    try:
+        token = str(st.secrets.get("GITHUB_TOKEN", "")).strip()
+        repo = str(st.secrets.get("GITHUB_REPO", "")).strip()
+        branch = str(st.secrets.get("GITHUB_BRANCH", "main")).strip() or "main"
+    except FileNotFoundError:
+        # Local development may not have a secrets.toml file.
+        pass
+    except Exception as exc:
+        logging.warning("Failed to read Streamlit secrets: %s", exc)
     return {
         "enabled": bool(token and repo and branch),
         "token": token,
@@ -791,6 +800,7 @@ with filter_cols[2]:
     amount_max = int(df["12개월+_금액"].max()) if "12개월+_금액" in df.columns else 0
     slider_max = amount_max if amount_max > 0 else 1
     amount_range = st.slider("장기재고 금액", 0, slider_max, (0, slider_max))
+    st.caption(f"선택 범위: {amount_range[0]:,} ~ {amount_range[1]:,}")
 
 with filter_cols[3]:
     search_text = st.text_input("검색", value="")
@@ -830,18 +840,18 @@ columns_to_show = [
 display_df = filtered[columns_to_show].copy()
 amount_display_cols = [col for col in columns_to_show if col.endswith("_금액")]
 for col in amount_display_cols:
-    display_df[col] = pd.to_numeric(display_df[col], errors="coerce").fillna(0).round(0).astype("int64")
-
-column_config = {
-    col: st.column_config.NumberColumn(col, format="%,d")
-    for col in amount_display_cols
-}
+    display_df[col] = (
+        pd.to_numeric(display_df[col], errors="coerce")
+        .fillna(0)
+        .round(0)
+        .astype("int64")
+        .map(lambda x: f"{x:,}")
+    )
 
 st.dataframe(
     display_df,
     use_container_width=True,
     height=420,
-    column_config=column_config if column_config else None,
 )
 
 download_zip = None
