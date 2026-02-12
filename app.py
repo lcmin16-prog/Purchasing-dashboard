@@ -91,6 +91,19 @@ def remove_header_like_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean_department_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if "담당부서" not in df.columns:
+        return df
+
+    dept_series = df["담당부서"].astype(str).str.strip()
+    invalid_values = {"", "nan", "none", "null", "담당부서"}
+    valid_mask = df["담당부서"].notna() & ~dept_series.str.lower().isin(invalid_values)
+
+    cleaned = df.loc[valid_mask].copy()
+    cleaned["담당부서"] = dept_series.loc[valid_mask]
+    return cleaned.reset_index(drop=True)
+
+
 def _safe_excel_name(name: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
     return cleaned or "부서"
@@ -488,6 +501,9 @@ except Exception as exc:
     st.stop()
 
 df = remove_header_like_rows(df)
+df = clean_department_rows(df)
+if "에이징" in df.columns:
+    df = df[df["에이징"] != "미상"].reset_index(drop=True)
 
 disposal_status_map = build_disposal_status_map(DISPOSAL_UPLOAD_DIR)
 if "품목코드" in df.columns:
@@ -498,16 +514,7 @@ else:
 
 department_options = ["전체"]
 if "담당부서" in df.columns:
-    dept_values = (
-        df["담당부서"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
-    dept_values = dept_values[
-        (dept_values != "")
-        & (dept_values != "담당부서")
-    ]
+    dept_values = df["담당부서"].dropna().astype(str).str.strip()
     department_options += sorted(dept_values.unique().tolist())
 
 amount_cols = [c for c in df.columns if c.endswith("_금액")]
@@ -781,8 +788,9 @@ with filter_cols[1]:
     selected_aging = st.selectbox("장기재고 기간", aging_options)
 
 with filter_cols[2]:
-    amount_max = float(df["12개월+_금액"].max()) if "12개월+_금액" in df.columns else 0
-    amount_range = st.slider("장기재고 금액", 0.0, float(amount_max) if amount_max > 0 else 1.0, (0.0, float(amount_max) if amount_max > 0 else 1.0))
+    amount_max = int(df["12개월+_금액"].max()) if "12개월+_금액" in df.columns else 0
+    slider_max = amount_max if amount_max > 0 else 1
+    amount_range = st.slider("장기재고 금액", 0, slider_max, (0, slider_max))
 
 with filter_cols[3]:
     search_text = st.text_input("검색", value="")
@@ -819,7 +827,22 @@ columns_to_show = [
     if col in filtered.columns
 ]
 
-st.dataframe(filtered[columns_to_show], use_container_width=True, height=420)
+display_df = filtered[columns_to_show].copy()
+amount_display_cols = [col for col in columns_to_show if col.endswith("_금액")]
+for col in amount_display_cols:
+    display_df[col] = pd.to_numeric(display_df[col], errors="coerce").fillna(0).round(0).astype("int64")
+
+column_config = {
+    col: st.column_config.NumberColumn(col, format="%,d")
+    for col in amount_display_cols
+}
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    height=420,
+    column_config=column_config if column_config else None,
+)
 
 download_zip = None
 if not filtered.empty and "담당부서" in filtered.columns and columns_to_show:
