@@ -56,10 +56,57 @@ def format_krw(value: float) -> str:
     return f"{value:,.0f}원"
 
 
+BUCKET_ORDER = ["3개월미만", "6개월미만", "12개월미만", "12개월 이상"]
+BUCKET_DEFINITIONS = [
+    (
+        "3개월미만",
+        ["M_금액", "M-1_금액", "M-2_금액"],
+        ["M_수량", "M-1_수량", "M-2_수량"],
+    ),
+    (
+        "6개월미만",
+        ["M-3_금액", "M-4_금액", "M-5_금액"],
+        ["M-3_수량", "M-4_수량", "M-5_수량"],
+    ),
+    (
+        "12개월미만",
+        ["M-6_금액", "M-7_금액", "M-8_금액", "M-9_금액", "M-10_금액", "M-11_금액"],
+        ["M-6_수량", "M-7_수량", "M-8_수량", "M-9_수량", "M-10_수량", "M-11_수량"],
+    ),
+    ("12개월 이상", ["12개월이상_금액"], ["12개월이상_수량"]),
+]
+TOTAL_AMOUNT_BASIS = "all_periods_cleaned_v1"
+
+
+def unique_columns(columns: list[str]) -> list[str]:
+    return list(dict.fromkeys(columns))
+
+
+def get_bucket_column_map(df: pd.DataFrame) -> dict[str, dict[str, list[str]]]:
+    bucket_map: dict[str, dict[str, list[str]]] = {}
+    for label, amount_cols, qty_cols in BUCKET_DEFINITIONS:
+        bucket_map[label] = {
+            "amount": [col for col in amount_cols if col in df.columns],
+            "qty": [col for col in qty_cols if col in df.columns],
+        }
+    return bucket_map
+
+
+def get_all_period_amount_columns(df: pd.DataFrame) -> list[str]:
+    bucket_map = get_bucket_column_map(df)
+    all_cols: list[str] = []
+    for label in BUCKET_ORDER:
+        all_cols.extend(bucket_map.get(label, {}).get("amount", []))
+    return unique_columns(all_cols)
+
+
 def calculate_inventory_total_amount(df: pd.DataFrame) -> float:
+    all_period_cols = get_all_period_amount_columns(df)
+    if all_period_cols:
+        return float(df[all_period_cols].sum().sum())
+    if "총재고금액" in df.columns:
+        return float(df["총재고금액"].sum())
     amount_cols = [c for c in df.columns if c.endswith("_금액")]
-    if "M_금액" in df.columns:
-        return float(df["M_금액"].sum())
     if amount_cols:
         return float(df[amount_cols].sum().sum())
     return 0.0
@@ -103,6 +150,14 @@ def clean_department_rows(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.loc[valid_mask].copy()
     cleaned["담당부서"] = dept_series.loc[valid_mask]
     return cleaned.reset_index(drop=True)
+
+
+def prepare_inventory_for_dashboard(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = remove_header_like_rows(df)
+    cleaned = clean_department_rows(cleaned)
+    if "에이징" in cleaned.columns:
+        cleaned = cleaned[cleaned["에이징"] != "미상"].reset_index(drop=True)
+    return cleaned
 
 
 def _safe_excel_name(name: str) -> str:
@@ -461,8 +516,10 @@ inventory_meta = load_upload_metadata(
         "last_uploaded_at": "",
         "last_uploaded_file": "",
         "last_total_amount": None,
+        "last_total_amount_basis": "",
         "previous_uploaded_at": "",
         "previous_total_amount": None,
+        "previous_total_amount_basis": "",
     },
 )
 disposal_meta = load_upload_metadata(
@@ -513,10 +570,7 @@ except Exception as exc:
     st.error(f"데이터 로딩 중 오류가 발생했습니다: {exc}")
     st.stop()
 
-df = remove_header_like_rows(df)
-df = clean_department_rows(df)
-if "에이징" in df.columns:
-    df = df[df["에이징"] != "미상"].reset_index(drop=True)
+df = prepare_inventory_for_dashboard(df)
 
 disposal_status_map = build_disposal_status_map(DISPOSAL_UPLOAD_DIR)
 if "품목코드" in df.columns:
@@ -530,7 +584,8 @@ if "담당부서" in df.columns:
     dept_values = df["담당부서"].dropna().astype(str).str.strip()
     department_options += sorted(dept_values.unique().tolist())
 
-amount_cols = [c for c in df.columns if c.endswith("_금액")]
+bucket_column_map = get_bucket_column_map(df)
+all_period_amount_cols = get_all_period_amount_columns(df)
 current_amount = calculate_inventory_total_amount(df)
 
 long_term_amount = df["12개월+_금액"].sum() if "12개월+_금액" in df.columns else 0
@@ -568,11 +623,15 @@ try:
     prev_update_amount = float(prev_update_amount) if prev_update_amount is not None else None
 except Exception:
     prev_update_amount = None
+prev_update_basis = str(inventory_meta.get("previous_total_amount_basis", "")).strip()
 
-if prev_update_amount and prev_update_amount != 0:
+if prev_update_amount and prev_update_amount != 0 and prev_update_basis == TOTAL_AMOUNT_BASIS:
     delta_pct = (current_amount - prev_update_amount) / prev_update_amount * 100
     delta_text = f"{'▲' if delta_pct >= 0 else '▼'} {abs(delta_pct):.1f}% (이전업데이트 대비)"
     delta_color = COLORS["danger_red"] if delta_pct >= 0 else COLORS["primary_blue"]
+elif prev_update_amount and prev_update_basis and prev_update_basis != TOTAL_AMOUNT_BASIS:
+    delta_text = "집계기준 변경으로 비교 불가"
+    delta_color = COLORS["text_gray"]
 else:
     delta_text = "이전업데이트 없음"
     delta_color = COLORS["text_gray"]
@@ -607,36 +666,25 @@ with left_col:
         horizontal=True,
     )
 
-    all_amount_cols = [
-        col
-        for col in df.columns
-        if col.endswith("_금액")
-        and (col.startswith("M") or col.startswith("12개월이상"))
-    ]
-    cols_3_plus = [
-        col
-        for col in df.columns
-        if col.startswith("M-")
-        and col.endswith("_금액")
-        and col not in {"M-1_금액", "M-2_금액"}
-    ] + (["12개월이상_금액"] if "12개월이상_금액" in df.columns else [])
-    cols_6_plus = [
-        col
-        for col in df.columns
-        if col.startswith("M-")
-        and col.endswith("_금액")
-        and col not in {"M-1_금액", "M-2_금액", "M-3_금액", "M-4_금액", "M-5_금액"}
-    ] + (["12개월이상_금액"] if "12개월이상_금액" in df.columns else [])
-    cols_12_plus = ["12개월이상_금액"] if "12개월이상_금액" in df.columns else []
+    cols_3_plus = unique_columns(
+        bucket_column_map.get("6개월미만", {}).get("amount", [])
+        + bucket_column_map.get("12개월미만", {}).get("amount", [])
+        + bucket_column_map.get("12개월 이상", {}).get("amount", [])
+    )
+    cols_6_plus = unique_columns(
+        bucket_column_map.get("12개월미만", {}).get("amount", [])
+        + bucket_column_map.get("12개월 이상", {}).get("amount", [])
+    )
+    cols_12_plus = bucket_column_map.get("12개월 이상", {}).get("amount", [])
 
     period_cols_map = {
-        "전체기간": all_amount_cols,
+        "전체기간": all_period_amount_cols,
         "3개월이상": cols_3_plus,
         "6개월이상": cols_6_plus,
         "12개월 이상": cols_12_plus,
     }
 
-    selected_cols = period_cols_map.get(period_filter, all_amount_cols)
+    selected_cols = period_cols_map.get(period_filter, all_period_amount_cols)
     dept_series = sum_amount_by_department(df, selected_cols)
     dept_amount = (
         dept_series.reset_index().rename(columns={0: "선택기간_금액"})
@@ -679,27 +727,10 @@ with right_col:
     if selected_right_department != "전체" and "담당부서" in df.columns:
         graph_df = df[df["담당부서"] == selected_right_department]
 
-    bucket_definitions = [
-        (
-            "3개월미만",
-            ["M_금액", "M-1_금액", "M-2_금액"],
-            ["M_수량", "M-1_수량", "M-2_수량"],
-        ),
-        (
-            "6개월미만",
-            ["M-3_금액", "M-4_금액", "M-5_금액"],
-            ["M-3_수량", "M-4_수량", "M-5_수량"],
-        ),
-        (
-            "12개월미만",
-            ["M-6_금액", "M-7_금액", "M-8_금액", "M-9_금액", "M-10_금액", "M-11_금액"],
-            ["M-6_수량", "M-7_수량", "M-8_수량", "M-9_수량", "M-10_수량", "M-11_수량"],
-        ),
-        ("12개월 이상", ["12개월이상_금액"], ["12개월이상_수량"]),
-    ]
-
     bucket_rows = []
-    for label, amount_cols, qty_cols in bucket_definitions:
+    for label in BUCKET_ORDER:
+        amount_cols = bucket_column_map.get(label, {}).get("amount", [])
+        qty_cols = bucket_column_map.get(label, {}).get("qty", [])
         bucket_rows.append(
             {
                 "기간": label,
@@ -744,16 +775,9 @@ st.markdown("<div class='section-title'>📊 기간별 담당부서 누적</div>
 st.markdown("<div class='section-card'>", unsafe_allow_html=True)
 
 if "담당부서" in df.columns:
-    dept_bucket_defs = {
-        "3개월미만": ["M_금액", "M-1_금액", "M-2_금액"],
-        "6개월미만": ["M-3_금액", "M-4_금액", "M-5_금액"],
-        "12개월미만": ["M-6_금액", "M-7_금액", "M-8_금액", "M-9_금액", "M-10_금액", "M-11_금액"],
-        "12개월 이상": ["12개월이상_금액"],
-    }
-
     dept_rows = []
-    for label, cols in dept_bucket_defs.items():
-        available = [col for col in cols if col in df.columns]
+    for label in BUCKET_ORDER:
+        available = bucket_column_map.get(label, {}).get("amount", [])
         if not available:
             continue
         grouped = df.groupby("담당부서")[available].sum().sum(axis=1)
@@ -762,9 +786,8 @@ if "담당부서" in df.columns:
 
     dept_bucket_df = pd.DataFrame(dept_rows)
     if not dept_bucket_df.empty:
-        period_order = ["3개월미만", "6개월미만", "12개월미만", "12개월 이상"]
         dept_bucket_df["기간구분"] = pd.Categorical(
-            dept_bucket_df["기간구분"], categories=period_order, ordered=True
+            dept_bucket_df["기간구분"], categories=BUCKET_ORDER, ordered=True
         )
         dept_bucket_df = dept_bucket_df.sort_values("기간구분")
 
@@ -912,19 +935,22 @@ if uploaded_file is not None:
     inventory_sig = f"{uploaded_file.name}:{len(inventory_bytes)}:{hash(inventory_bytes)}"
     if st.session_state.get("inventory_upload_sig") != inventory_sig:
         try:
-            uploaded_df_preview = load_inventory_data(uploaded_file.getvalue())
+            uploaded_df_preview = prepare_inventory_for_dashboard(load_inventory_data(uploaded_file.getvalue()))
             new_total_amount = calculate_inventory_total_amount(uploaded_df_preview)
             prev_last_amount = inventory_meta.get("last_total_amount")
+            prev_last_basis = str(inventory_meta.get("last_total_amount_basis", "")).strip()
             prev_last_uploaded_at = inventory_meta.get("last_uploaded_at", "")
 
             github_synced = persist_uploaded_file(uploaded_file, LATEST_INVENTORY_FILE, github_cfg)
             if prev_last_amount is not None:
                 inventory_meta["previous_total_amount"] = float(prev_last_amount)
+                inventory_meta["previous_total_amount_basis"] = prev_last_basis
             if prev_last_uploaded_at:
                 inventory_meta["previous_uploaded_at"] = prev_last_uploaded_at
             inventory_meta["last_uploaded_at"] = _now_str()
             inventory_meta["last_uploaded_file"] = uploaded_file.name
             inventory_meta["last_total_amount"] = float(new_total_amount)
+            inventory_meta["last_total_amount_basis"] = TOTAL_AMOUNT_BASIS
             save_upload_metadata(
                 github_cfg,
                 INVENTORY_META_FILE,
