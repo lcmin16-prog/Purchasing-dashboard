@@ -417,7 +417,7 @@ def _status_priority(status: str) -> int:
 
 def _normalize_plan_status(value) -> str:
     if pd.isna(value) or str(value).strip() == "":
-        return "✅ 계획 등록됨"
+        return "❌ 미등록"
     text = str(value).strip()
     if "완료" in text:
         return "🎯 완료"
@@ -904,6 +904,90 @@ st.download_button(
     mime="application/zip",
     disabled=download_zip is None,
 )
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<div class='section-title'>📌 소진계획 유형 집계</div>", unsafe_allow_html=True)
+st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+
+if filtered.empty:
+    st.info("집계할 상세현황 데이터가 없습니다.")
+else:
+    plan_summary_df = filtered.copy()
+    plan_labels = plan_summary_df["소진계획"].astype(str).str.strip()
+    invalid_plan = {"", "nan", "none", "null"}
+    plan_summary_df["소진계획유형"] = plan_labels.mask(
+        plan_labels.str.lower().isin(invalid_plan),
+        "❌ 미등록",
+    )
+
+    if "12개월+_금액" in plan_summary_df.columns:
+        plan_summary_df["_장기재고금액"] = pd.to_numeric(plan_summary_df["12개월+_금액"], errors="coerce").fillna(0)
+    else:
+        plan_summary_df["_장기재고금액"] = 0.0
+
+    if "M_수량" in plan_summary_df.columns:
+        plan_summary_df["_수량합계"] = pd.to_numeric(plan_summary_df["M_수량"], errors="coerce").fillna(0)
+    else:
+        plan_summary_df["_수량합계"] = 0.0
+
+    plan_summary = (
+        plan_summary_df.groupby("소진계획유형", dropna=False)
+        .agg(
+            품목수=("소진계획유형", "size"),
+            장기재고금액=("_장기재고금액", "sum"),
+            수량합계=("_수량합계", "sum"),
+        )
+        .reset_index()
+        .sort_values(["품목수", "장기재고금액"], ascending=False)
+    )
+
+    total_items = int(plan_summary["품목수"].sum())
+    unregistered_items = int(
+        plan_summary.loc[plan_summary["소진계획유형"] == "❌ 미등록", "품목수"].sum()
+    )
+    registered_items = total_items - unregistered_items
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("집계 품목수", f"{total_items:,}개")
+    metric_cols[1].metric("미등록", f"{unregistered_items:,}개")
+    metric_cols[2].metric("등록/진행/완료", f"{registered_items:,}개")
+
+    summary_chart = px.bar(
+        plan_summary,
+        x="품목수",
+        y="소진계획유형",
+        orientation="h",
+        text="품목수",
+        color="품목수",
+        color_continuous_scale=[COLORS["primary_light"], COLORS["primary_dark"]],
+    )
+    summary_chart.update_layout(
+        height=max(280, 40 * len(plan_summary) + 120),
+        margin=dict(l=10, r=10, t=10, b=10),
+        coloraxis_showscale=False,
+        xaxis_title="품목수",
+        yaxis_title="소진계획유형",
+    )
+    summary_chart.update_traces(texttemplate="%{text:,}", textposition="outside", cliponaxis=False)
+    st.plotly_chart(summary_chart, use_container_width=True)
+
+    plan_summary_display = plan_summary.copy()
+    plan_summary_display["장기재고금액"] = (
+        pd.to_numeric(plan_summary_display["장기재고금액"], errors="coerce")
+        .fillna(0)
+        .round(0)
+        .astype("int64")
+        .map(lambda x: f"{x:,}")
+    )
+    plan_summary_display["수량합계"] = (
+        pd.to_numeric(plan_summary_display["수량합계"], errors="coerce")
+        .fillna(0)
+        .round(0)
+        .astype("int64")
+        .map(lambda x: f"{x:,}")
+    )
+    st.dataframe(plan_summary_display, use_container_width=True, hide_index=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
